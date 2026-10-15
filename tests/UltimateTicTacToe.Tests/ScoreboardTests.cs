@@ -1,7 +1,7 @@
-using GameTemplate.Core;
+using UltimateTicTacToe.Core;
 using Xunit;
 
-namespace GameTemplate.Tests;
+namespace UltimateTicTacToe.Tests;
 
 public class ScoreboardTests
 {
