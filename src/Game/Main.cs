@@ -56,6 +56,7 @@ public partial class Main : Node3D
 
 	private bool _demo;
 	private bool _quitAfterDemo;
+	private string? _clip;
 	private float _initialSpin;
 
 	private bool VsComputer => _settings.Mode == GameMode.PlayerVsComputer || _demo;
@@ -87,17 +88,12 @@ public partial class Main : Node3D
 
 		_hud = new GameHud(theme);
 		AddChild(_hud);
-		_hud.Build(new HudOptions("Ultimate TTT", "Play in a glowing board  ·  Drag sideways to spin", PiecesLabel: "X & O",
-			PieceName: s => $"{Styles.Pieces(s).NameOne} & {Styles.Pieces(s).NameTwo}"),
-			_settings.Muted, _settings.Mode, _settings.Difficulty, _settings.Board, _settings.Pieces);
+		_hud.Build(new HudOptions(Title, "Play in a glowing board  ·  Drag sideways to spin", PiecesLabel: "X & O",
+			PieceName: s => $"{Styles.Pieces(s).NameOne} & {Styles.Pieces(s).NameTwo}"), _settings);
 		_hud.NewGamePressed += OnNewGamePressed;
 		_hud.UndoPressed += OnUndoPressed;
-		_hud.MuteToggled += muted =>
-		{
-			_settings.Muted = muted;
-			AudioServer.SetBusMute(0, muted);
-			_settings.Save();
-		};
+		_hud.RestartPressed += OnRestartPressed;
+		_hud.SetTutorial(Tutorial.Pages);
 		_hud.ModeChosen += (mode, difficulty) =>
 		{
 			_settings.Mode = mode;
@@ -119,9 +115,18 @@ public partial class Main : Node3D
 			Rebuild();
 		};
 
-		_spin = new SpinControl(_rig, () => !_busy);
+		_spin = new SpinControl(_rig, () => !_busy && !_settings.FreezeBoard);
 		_spin.Tapped += OnTapped;
+		if (_clip != null)
+		{
+			_hud.Visible = false;
+			_ = PlayClip(_clip);
+			return;
+		}
 		_ = StartGame();
+		if (!_demo)
+			_hud.OfferTutorialOnce(_settings);
+		_hud.ApplyDevFlags();
 	}
 
 	// ---------------------------------------------------------------- World
@@ -252,7 +257,10 @@ public partial class Main : Node3D
 		{
 			_roundCounted = true;
 			if (_game.Winner is { } winner)
+			{
 				_wins.Win(first: winner == Mark.X);
+				await SetWinnerAlight(winner);
+			}
 		}
 		_busy = false;
 		RefreshUi();
@@ -283,7 +291,7 @@ public partial class Main : Node3D
 		rise.TweenProperty(big, "scale", Vector3.One, 0.45f).SetTrans(Tween.TransitionType.Back).SetEase(Tween.EaseType.Out);
 		Sparkle.Burst(_rig, rest + new Vector3(0, 0.4f, 0));
 		_sound.Play(_impacts.Random(_settings.Pieces), big.GlobalPosition, Styles.GainDb(_settings.Pieces) + 4f, 0.8f);
-		_hud.SetStatus(_game.IsOver ? "" : $"{NameOf(winner)} {(NameOf(winner) == "You" ? "take" : "takes")} a board!", ColorOf(winner));
+		_hud.SetStatus(_game.IsOver ? "" : $"{winner} · {NameOf(winner)} {(NameOf(winner) == "You" ? "take" : "takes")} a board!", ColorOf(winner));
 		await ToSignal(rise, Tween.SignalName.Finished);
 		foreach (var mesh in MeshesOf(big))
 			mesh.MaterialOverlay = null;
@@ -350,6 +358,7 @@ public partial class Main : Node3D
 	private async Task StartGame()
 	{
 		_computer.Cancel();
+		PutOutFire();
 		_busy = true;
 		_roundCounted = false;
 		_game.Reset();
@@ -387,6 +396,159 @@ public partial class Main : Node3D
 		}
 	}
 
+	private void OnRestartPressed()
+	{
+		if (_busy)
+			return;
+		if (_game.IsOver || _game.MovesMade == 0)
+		{
+			_ = StartGame();
+			return;
+		}
+		_hud.AskRestart(VsComputer && !_demo, countLoss =>
+		{
+			if (countLoss)
+				_wins.Win(first: Human != Mark.X);
+			_ = StartGame();
+		}, then => _ads.ShowRewarded(rewarded: then, closed: () => { }));
+	}
+
+	// ---------------------------------------------------------------- The winner's fire
+
+	private readonly List<Flames> _fires = new();
+
+	/// <summary>
+	/// The three giant marks of the winning line catch fire one after another; the winner's other
+	/// giant marks smoulder (glow without flames, which keeps it light on a phone).
+	/// </summary>
+	private async Task SetWinnerAlight(Mark winner)
+	{
+		int won = winner == Mark.X ? _game.WonX : _game.WonO;
+		int line = UltimateGame.WinningLine(won);
+		var boards = Enumerable.Range(0, 9).Where(b => (line & (1 << b)) != 0)
+			.Concat(Enumerable.Range(0, 9).Where(b => (won & (1 << b)) != 0 && (line & (1 << b)) == 0));
+		int lit = 0;
+		foreach (int board in boards)
+		{
+			if (_bigMarks[board] is not { } big)
+				continue;
+			bool inLine = (line & (1 << board)) != 0;
+			_fires.Add(Flames.SetAlight(_rig, big.Position + new Vector3(0, 0.2f, 0), MeshesOf(big), radius: 0.85f, size: 2.2f, withLight: lit == 0, particles: inLine));
+			lit++;
+			if (inLine)
+				await Wait(0.25f);
+		}
+		_hud.SetStatus(NameOf(winner) == "You" ? $"{winner} · You win!" : $"{winner} · {NameOf(winner)} wins!", ColorOf(winner));
+		await Wait(0.4f);
+	}
+
+	private void PutOutFire()
+	{
+		foreach (var fire in _fires)
+			fire.Extinguish();
+		_fires.Clear();
+		foreach (var big in _bigMarks)
+		{
+			if (big == null)
+				continue;
+			foreach (var mesh in MeshesOf(big))
+				mesh.MaterialOverlay = null;
+		}
+	}
+
+	// ---------------------------------------------------------------- Tutorial clips
+
+	/// <summary>
+	/// Plays one scripted scene for the tutorial (with --clip=name; Record-Clips.ps1 records it),
+	/// then quits. The HUD is hidden so the clip shows only the board.
+	/// </summary>
+	private async Task PlayClip(string clip)
+	{
+		_settings.Mode = GameMode.PlayerVsPlayer;
+		_settings.Muted = false;
+		_game.Reset();
+		Rebuild();
+		await Wait(0.5f);
+		switch (clip)
+		{
+			case "send":
+				// Each move sends the other player to the matching small board.
+				foreach (var (board, cell) in new[] { (4, 0), (0, 8), (8, 4), (4, 2) })
+				{
+					ShowGlows(true);
+					await Wait(1.1f);
+					await PlayMove(board, cell);
+				}
+				ShowGlows(true);
+				await Wait(1.4f);
+				break;
+			case "claim":
+			{
+				// A real game up to the first chance to win a small board, then that move on camera.
+				var computer = new ComputerPlayer(Difficulty.Medium, seed: 7);
+				while (!WinsBoardNext(out _))
+				{
+					int m = computer.ChooseMove(_game);
+					_game.Play(m / 9, m % 9);
+				}
+				Rebuild();
+				ShowGlows(true);
+				await Wait(1.2f);
+				WinsBoardNext(out int move);
+				await PlayMove(move / 9, move % 9);
+				ShowGlows(true);
+				await Wait(1.8f);
+				break;
+			}
+			case "end":
+			{
+				// Self-play until a game ends with a winner, replayed so the last few moves show.
+				var moves = new List<int>();
+				for (int seed = 1; ; seed++)
+				{
+					var trial = new UltimateGame();
+					var computer = new ComputerPlayer(Difficulty.Medium, seed: seed);
+					moves.Clear();
+					while (!trial.IsOver)
+					{
+						int m = computer.ChooseMove(trial);
+						moves.Add(m);
+						trial.Play(m / 9, m % 9);
+					}
+					if (trial.Winner != null)
+						break;
+				}
+				for (int i = 0; i < moves.Count - 3; i++)
+					_game.Play(moves[i] / 9, moves[i] % 9);
+				Rebuild();
+				await Wait(0.6f);
+				for (int i = moves.Count - 3; i < moves.Count; i++)
+				{
+					await PlayMove(moves[i] / 9, moves[i] % 9);
+					await Wait(0.4f);
+				}
+				await Wait(2.6f);
+				break;
+			}
+		}
+		GetTree().Quit();
+	}
+
+	/// <summary>True if the side to move can win a small board right now (and which move does it).</summary>
+	private bool WinsBoardNext(out int move)
+	{
+		foreach (int m in _game.LegalMoves())
+		{
+			if (_game.Clone().Play(m / 9, m % 9).WonBoard)
+			{
+				move = m;
+				return true;
+			}
+		}
+		move = -1;
+		return false;
+	}
+
 	private bool CanUndo => VsComputer && !_demo && !_busy && _game.MovesMade > 0 && (_game.IsOver || _game.Turn == Human);
 
 	private void OnUndoPressed()
@@ -401,6 +563,7 @@ public partial class Main : Node3D
 	private void UndoLastTurn()
 	{
 		_computer.Cancel();
+		PutOutFire();
 		if (_game.IsOver && _roundCounted && _game.Winner is { } winner)
 			_wins.Unwin(first: winner == Mark.X);
 		_roundCounted = false;
@@ -430,9 +593,10 @@ public partial class Main : Node3D
 	private void RefreshUi(Mark? mover = null)
 	{
 		int x = System.Numerics.BitOperations.PopCount((uint)_game.WonX), o = System.Numerics.BitOperations.PopCount((uint)_game.WonO);
-		_hud.SetScore($"{NameOf(Mark.X)}  {x}   —   {o}  {NameOf(Mark.O)}");
+		_hud.SetScore($"X  {NameOf(Mark.X)}  {x}   —   {o}  {NameOf(Mark.O)}  O");
 		_hud.SetNewGameVisible(_game.IsOver && !_busy);
 		_hud.SetUndoVisible(CanUndo);
+		_hud.SetRestartVisible(!_game.IsOver);
 		ShowGlows(!_busy && !_game.IsOver && (!IsComputerTurn || _demo));
 		if (_game.IsOver)
 		{
@@ -442,8 +606,8 @@ public partial class Main : Node3D
 			string text = _game.Winner switch
 			{
 				null => $"A draw! {wins}",
-				{ } w when NameOf(w) == "You" => $"You win! {wins}",
-				{ } w => $"{NameOf(w)} wins {wins}",
+				{ } w when NameOf(w) == "You" => $"{w} · You win! {wins}",
+				{ } w => $"{w} · {NameOf(w)} wins {wins}",
 			};
 			_hud.SetStatus(text, _game.Winner is { } side ? ColorOf(side) : Colors.White);
 			if (_demo && _quitAfterDemo)
@@ -452,8 +616,9 @@ public partial class Main : Node3D
 		}
 		var turn = mover ?? _game.Turn;
 		string where = _game.NextBoard == UltimateGame.Any ? ": play anywhere" : "";
-		string status = mover == null && IsComputerTurn && !_demo ? "Computer is thinking…"
-			: NameOf(turn) == "You" ? $"Your turn{where}" : $"{NameOf(turn)}'s turn";
+		// The mark comes first: players think of themselves as X or O.
+		string status = mover == null && IsComputerTurn && !_demo ? $"{turn} · Computer is thinking…"
+			: NameOf(turn) == "You" ? $"{turn} · Your turn{where}" : $"{turn} · {NameOf(turn)}'s turn{where}";
 		_hud.SetStatus(status, ColorOf(turn));
 	}
 
@@ -493,6 +658,9 @@ public partial class Main : Node3D
 					break;
 				case "--spin":
 					_initialSpin = Mathf.DegToRad(float.Parse(value, System.Globalization.CultureInfo.InvariantCulture));
+					break;
+				case "--clip":
+					_clip = value;
 					break;
 			}
 		}
