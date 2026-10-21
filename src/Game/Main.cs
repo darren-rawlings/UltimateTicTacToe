@@ -23,7 +23,9 @@ public partial class Main : Node3D
 	public const string Title = "Ultimate Tic-Tac-Toe";
 
 	/// <summary>Google's test ad units until the real ones exist in AdMob (see the release playbook).</summary>
-	private static readonly AdMobConfig AdUnits = AdMobConfig.Test;
+	private static readonly AdMobConfig AdUnits = new(
+		InterstitialUnitId: "ca-app-pub-3310172999423635/1969857018",
+		RewardedUnitId: "ca-app-pub-3310172999423635/4416231965");
 
 	private const Mark Human = Mark.X;
 	private const float Cell = 0.85f;
